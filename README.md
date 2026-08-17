@@ -1,5 +1,5 @@
 # 505M GPT Training Pipeline
-## Comprehensive Technical Report (Kaggle 2×T4 DDP Edition)
+## Comprehensive Technical Report 
 
 ---
 
