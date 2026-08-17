@@ -1,11 +1,11 @@
-# Philiane Supernova — 505M GPT Training Pipeline
+505M GPT Training Pipeline
 ## Comprehensive Technical Report (Kaggle 2×T4 DDP Edition)
 
 ---
 
 ## 1. Executive Summary
 
-Philiane Supernova is a decoder-only GPT language model at **~505M parameters**, trained on the `open-web-math/open-web-math` corpus, streamed live from Hugging Face rather than downloaded to disk. The pipeline runs on Kaggle's dual-T4 (2×15.6GB VRAM) instances using PyTorch's `DistributedDataParallel` (DDP), launched via `torchrun`, and is designed to be checkpoint-compatible with a parallel single-GPU Colab baseline notebook. It is architected as a stepping stone toward multi-node EC2 training.
+505M GPT is a decoder-only GPT language model at **~505M parameters**, trained on the `open-web-math/open-web-math` corpus, streamed live from Hugging Face rather than downloaded to disk. The pipeline runs on Kaggle's dual-T4 (2×15.6GB VRAM) instances using PyTorch's `DistributedDataParallel` (DDP), launched via `torchrun`, and is designed to be checkpoint-compatible with a parallel single-GPU Colab baseline notebook. It is architected as a stepping stone toward multi-node EC2 training.
 
 The system is built around three constraints that shape almost every design decision below:
 - **VRAM scarcity** — T4s have no flash-attention-v2 kernel and only 15.6GB each, so the model sits close to the OOM edge.
