@@ -132,7 +132,7 @@ This is flagged in the notebook as a hard-won fix, and is worth stating precisel
 tokens/step = WORLD_SIZE × micro_batch_size × grad_accum_steps × block_size
 ```
 
-If `grad_accum_steps` is copied unchanged from a single-GPU config into a 2-GPU DDP config, the effective batch silently doubles — which desyncs the LR schedule, warmup, eval cadence, and step-for-step checkpoint comparability against the single-GPU baseline, even though total tokens over the full run still eventually converge. The fix here was to halve `grad_accum_steps` (64→...→8 in the current config) so 2×T4 DDP matches the single-GPU Colab's tokens/step exactly.
+If `micro_batch_size` and `grad_accum_steps` are copied unchanged from a single-GPU config into a 2-GPU DDP config, the effective batch silently doubles — which desyncs the LR schedule, warmup, eval cadence, and step-for-step checkpoint comparability against the single-GPU baseline, even though total tokens over the full run still eventually converge. The fix here was to halve both `micro_batch_size` (16→8) and `grad_accum_steps` (64→8) so 2×T4 DDP matches the single-GPU Colab's tokens/step exactly.
 
 ### 3.3 Gradient accumulation & sync mechanics
 
@@ -179,9 +179,9 @@ Worth being precise here, since "mixed precision" is often described loosely as 
 
 **Gradients and backward:** autograd's convention is that a parameter's `.grad` always matches the parameter's own dtype — so even though the forward matmuls for `c_attn`/`c_proj`/FFN/`head` ran in fp16, the gradients landing on those fp32 parameters are themselves fp32 (upcast automatically during backward). `GradScaler` exists specifically to protect the *fp16-valued intermediate* gradients computed while backpropagating through the fp16 matmul ops — before that upcast happens — from flushing to zero due to fp16's narrow representable range near small magnitudes. `scaler.scale(loss)` multiplies the loss by a large factor before backward so those intermediate gradients land in a representable fp16 range; `scaler.unscale_()` divides them back down before clipping and the optimizer step see them.
 
-**A separate, unrelated precision axis — optimizer state:** the 8-bit paged AdamW's quantization (§4) is *not* part of this autocast picture at all. It compresses the optimizer's fp32 first/second moment buffers (`exp_avg`, `exp_avg_sq`) into int8 with per-block scaling factors for storage, dequantizing back to fp32 on the fly during each update step. This is orthogonal to — and stacks with — the fp16/fp32 autocast split above: one governs forward/backward compute precision, the other governs how much VRAM the optimizer's bookkeeping state consumes at rest.
+**A separate, unrelated precision axis — optimizer state:** the 8-bit paged AdamW's quantization (§4) is *not* part of this autocast picture at all. It compresses the optimizer's fp32 first/second moment buffers (`exp_avg`, `exp_avg_sq`) into int8 with per-block scaling factors for storage, dequantizing back to fp32 on the fly during each update step. This is orthogonal to — and stacks with — the fp16/fp32 autocast split above: one governs forward/backward compute precision, the other governs how much VRAM the optimizer's bookkeeping state consumes at rest. **Note: the model weights themselves are never quantized by this — they remain fp32 on disk in every checkpoint (§8.1). Only the AdamW optimizer's internal moment buffers are int8.**
 
-### 3.5 Steps-per-epoch accounting
+### 3.6 Steps-per-epoch accounting
 
 ```python
 STEPS_PER_EPOCH = (DOCS_PER_EPOCH * 350) // (block_size + 1) // (
@@ -197,7 +197,7 @@ STEPS_PER_EPOCH = (DOCS_PER_EPOCH * 350) // (block_size + 1) // (
 **Primary: `bitsandbytes` 8-bit paged AdamW** (`PagedAdamW8bit`, falling back to plain `AdamW8bit`, then to fp32 `torch.optim.AdamW` with `fused=True` if `bitsandbytes` isn't installed).
 
 - Standard AdamW keeps two fp32 moment buffers (`exp_avg`, `exp_avg_sq`) per parameter — for 505M params, that's roughly **4GB of optimizer state alone**, a large fraction of a T4's 15.6GB budget before any activations or weights are counted.
-- 8-bit quantized optimizer state cuts this to **~1GB**.
+- 8-bit quantized optimizer state cuts this to **~1GB**. This is optimizer-state quantization only — the model's own weights stay fp32 throughout (see §3.5).
 - The **paged** variant additionally spills optimizer state to CPU pinned memory under GPU memory pressure instead of raising an OOM — a real safety margin on hardware operating this close to its VRAM ceiling.
 - Parameters are split into two groups: `weight_decay=0.1` for all 2D+ tensors (linear/embedding weights) and `weight_decay=0.0` for 1D tensors (LayerNorm weights/biases) — the standard practice of not decaying norm and bias parameters.
 - Betas: `(0.9, 0.95)` — the lower β2 (vs. the more common 0.999) is a common LLM-training choice that makes the second-moment estimate more responsive, often paired with aggressive LR schedules and gradient clipping like this config uses.
@@ -254,15 +254,15 @@ T4s carry 15.6GB VRAM each with no flash-attention-v2 support, so most of the "s
 |---|---|
 | 8-bit paged AdamW | Optimizer state ~4GB → ~1GB |
 | Gradient checkpointing (per block) | Trades recompute for activation memory |
-| `micro_batch 2→1, grad_accum 64→128` (historical tuning) | Same effective batch, lower peak per step |
+| `micro_batch 16→8, grad_accum 64→8` (historical tuning) | Same effective batch, lower peak per step |
 | SDPA backend pinned to memory-efficient | Avoids silent fallback to VRAM-heavy "math" attention |
 | `torch.cuda.empty_cache()` | Called after optimizer-state load, after DDP wrap, and every 50 steps |
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, max_split_size_mb:128` | Fights allocator fragmentation over long runs |
 | Bias-free linear layers | Marginal but consistent parameter/activation reduction |
 
-### 6.1 Per-rank VRAM telemetry
+### 6.1 Per-rank VRAM telemetry (console)
 
-`_log_vram(label)` prints `torch.cuda.memory_allocated()` and `memory_reserved()` **from every rank individually** (not just rank 0), at key lifecycle points: after `model.to(device)`, after checkpoint resume, after the DDP wrap, after the first optimizer step, and every 50 steps thereafter. This per-rank granularity is deliberate — an OOM can hit either T4 independently (e.g. due to slightly different data-shard token distributions per rank), and a single combined/averaged number would mask which specific GPU is at risk.
+`_log_vram(label)` prints `torch.cuda.memory_allocated()` and `memory_reserved()` **from every rank individually** (not just rank 0), at key lifecycle points: after `model.to(device)`, after checkpoint resume, after the DDP wrap, after the first optimizer step, and every 50 steps thereafter. This per-rank granularity is deliberate — an OOM can hit either T4 independently (e.g. due to slightly different data-shard token distributions per rank), and a single combined/averaged number would mask which specific GPU is at risk. This is distinct from the CSV telemetry in §9, which averages VRAM/utilization across GPUs rather than logging per-rank — see §9 for why.
 
 ### 6.2 Data-throughput-side memory hygiene
 
@@ -315,7 +315,7 @@ Unlike training data, the validation set is **not streamed per-step** — it's m
 
 ### 8.1 What's saved
 
-Each checkpoint (`ckpt_{step:06d}.pt`) contains: raw (DDP-`module.`-prefix-stripped) model state dict, optimizer state dict, GradScaler state dict, the full `cfg` dataclass, and current losses — saved by rank 0 only, at every `eval_interval`.
+Each checkpoint (`ckpt_{step:06d}.pt`) contains: `step`, `epoch`, `epoch_step`, raw (DDP-`module.`-prefix-stripped) model state dict, optimizer state dict, GradScaler state dict, the full `cfg` dataclass, and current losses — saved by rank 0 only, at every `eval_interval`. The model state dict is fp32 in every checkpoint; nothing about this pipeline reduces on-disk model precision (see §3.5, §4).
 
 ### 8.2 Local rotation
 
@@ -352,18 +352,18 @@ Every eval interval (rank 0 only), a row is appended to `training_stats.csv` wit
 
 ```
 step, epoch, train_loss, train_perplexity, val_loss, val_perplexity,
-learning_rate, grad_norm, weight_norm,
-gpu0_util_pct, gpu1_util_pct, vram_gpu0_gb, vram_gpu1_gb,
-mfu_percentage, step_time_s, tokens_per_sec
+learning_rate, grad_norm, grad_clipping_ratio, weight_norm,
+gpu_utilization_pct, vram_allocated_gb, vram_reserved_gb,
+mfu_percentage, step_time, tokens_per_sec
 ```
 
-- **Per-GPU columns** (`gpu0`/`gpu1`) rather than an aggregate, for the same reason as the VRAM logging in §6.1 — OOM and utilization issues can be rank-specific.
+- **GPU utilization and VRAM are averaged across all GPUs visible to the process**, rather than split into per-GPU columns. This is a deliberate schema-compatibility choice: using the same fieldnames as the single-GPU Colab baseline means a 2-GPU Kaggle run and a 1-GPU Colab run produce directly comparable/mergeable CSVs regardless of `WORLD_SIZE`. In practice this tradeoff has cost little — across the actual runs, utilization has shown no meaningful spread between the two T4s, so the averaged figure tracks each GPU closely. Finer-grained, per-rank VRAM visibility is still available separately via the console logs (§6.1's `_log_vram`), which log individually per rank rather than averaging.
 - **GPU utilization** comes from NVML (`pynvml`), queried only by rank 0, which can see both device handles on the box regardless of which GPU it personally owns — guarded so a driver/permissions failure degrades to `None` values rather than interrupting training.
-- **VRAM** comes directly from `torch.cuda.memory_allocated()` per device — no NVML dependency needed for this metric.
-- **Grad norm** is captured as the return value of `clip_grad_norm_()` rather than recomputed separately, since that function already computes the global L2 norm internally as part of clipping.
+- **VRAM** comes directly from `torch.cuda.memory_allocated()` / `memory_reserved()`, averaged across visible devices — no NVML dependency needed for this metric.
+- **Grad norm** is captured as the return value of `clip_grad_norm_()` rather than recomputed separately, since that function already computes the global L2 norm internally as part of clipping. **`grad_clipping_ratio`** tracks the fraction of steps in each eval window where the gradient actually exceeded `grad_clip` and was clipped — a coarse signal for how often clipping is doing real work vs. being a no-op safety net.
 - **Weight norm** (`_weight_norm`) computes the global L2 norm across all trainable parameters, useful as a coarse signal for weight growth/divergence over training.
-- The CSV header includes a `timestamp` column added in a recent revision — resuming with an older, headerless-mismatched CSV requires deleting it first to avoid column misalignment (noted as an open caveat, not automated).
-- On resume, `init_stats_csv()` checks for an existing file and, if present (either from the same session or seeded per §8.6), leaves it alone and appends — so telemetry history accumulates across sessions rather than resetting.
+- On resume, `init_stats_csv()` checks that an existing CSV's header matches the current script's schema before appending; a mismatch (e.g. from an older script version with a different column set) triggers archiving the old file and starting fresh, rather than silently misaligning columns.
+- If the schema matches (either from the same session or seeded per §8.6), the existing file is left alone and appended to — so telemetry history accumulates across sessions rather than resetting.
 
 ---
 
@@ -382,7 +382,7 @@ Summarizing the defensive patterns spread throughout the pipeline:
 
 | Issue | Root cause | Fix |
 |---|---|---|
-| Token/step mismatch | `grad_accum_steps` unchanged when moving from 1-GPU to 2-GPU DDP, silently doubling effective batch | Halved `grad_accum_steps` (16→8) to compensate for `WORLD_SIZE` |
+| Token/step mismatch | `micro_batch_size` and `grad_accum_steps` left unchanged when moving from 1-GPU to 2-GPU DDP, silently doubling effective batch | Halved both: `micro_batch_size` 16→8, `grad_accum_steps` 64→8 — compensating for `WORLD_SIZE` so 2×T4 DDP matches single-GPU Colab's tokens/step exactly |
 | Silent config overwrite on resume | `load_checkpoint()` replaced the entire `cfg` object with the pickled checkpoint version | Selectively restore only architecture-critical fields; training hyperparameters stay governed by the current script |
 | Checkpoint staging performance bug (~60× step-time spikes) | Synchronous multi-GB `shutil.copy` into RAM-backed `/tmp` on the main training thread | Moved staging into the background push thread, target `/kaggle/working` with `os.link()` hardlinks |
 | `STEPS_PER_EPOCH` 2× overcounting | Formula divisor missing `WORLD_SIZE × micro_batch_size` | Added missing terms to the divisor |
@@ -396,7 +396,7 @@ None of these fixes required a training restart from scratch — none touched mo
 ## 12. Compatibility & Roadmap
 
 - **Cross-platform checkpoint compatibility**: the DDP `module.` prefix is stripped before saving (`model.module.state_dict()`), so checkpoint `.pt` files load cleanly on both the 2×T4 Kaggle DDP setup and the single-GPU Colab baseline notebook without any translation step.
-- **Stated trajectory**: single-GPU Colab (baseline) → dual-T4 Kaggle DDP (current) → multi-node EC2 via PyTorch DDP (future target). The current pipeline's explicit `WORLD_SIZE`-aware scaling (batch-size compensation, MFU denominator, per-rank telemetry) is written generally enough to extend to a higher `WORLD_SIZE` across nodes, though multi-node introduces additional concerns not yet addressed here — network-topology-aware NCCL configuration, inter-node bandwidth as a new bottleneck (vs. intra-box NVLink/PCIe), and rendezvous/fault-tolerance across node failures (as opposed to just process failures on one box).
+- **Stated trajectory**: single-GPU Colab (baseline) → dual-T4 Kaggle DDP (current) → multi-node EC2 via PyTorch DDP (future target). The current pipeline's explicit `WORLD_SIZE`-aware scaling (batch-size compensation, MFU denominator, telemetry schema shared across both platforms) is written generally enough to extend to a higher `WORLD_SIZE` across nodes, though multi-node introduces additional concerns not yet addressed here — network-topology-aware NCCL configuration, inter-node bandwidth as a new bottleneck (vs. intra-box NVLink/PCIe), and rendezvous/fault-tolerance across node failures (as opposed to just process failures on one box).
 
 ---
 
@@ -406,18 +406,18 @@ None of these fixes required a training restart from scratch — none touched mo
 |---|---|---|
 | Attention backend | Force memory-efficient SDPA | T4 lacks flash-attn-v2; avoid silent fallback to VRAM-heavy math backend |
 | Activation memory | Per-block gradient checkpointing | Required to fit 505M params × 1024 context on 15.6GB |
-| Optimizer memory | Paged 8-bit AdamW | ~4GB → ~1GB optimizer state, with CPU-spill safety margin |
+| Optimizer memory | Paged 8-bit AdamW | ~4GB → ~1GB optimizer state, with CPU-spill safety margin; model weights stay fp32 |
 | Precision | fp16/bf16 autocast + GradScaler | Throughput + memory, with clip performed on unscaled grads |
-| Batch scaling | `grad_accum_steps` halved for 2×T4 | Keep tokens/step identical across single- and multi-GPU configs |
+| Batch scaling | `micro_batch_size` and `grad_accum_steps` halved for 2×T4 | Keep tokens/step identical across single- and multi-GPU configs |
 | Gradient sync | Only on last micro-step (`no_sync()`) | Avoid per-micro-step NCCL overhead |
 | Data source | HF streaming dataset, no local materialization | Corpus far exceeds convenient local storage |
 | Data sharding | Per-rank shuffle seed, no distributed sampler | Streaming + unbounded dataset makes a coordinated sampler impractical |
 | Checkpoint durability | Async push to Kaggle Model registry | `/kaggle/working` doesn't reliably survive past a session |
 | Checkpoint staging | Background thread, same-filesystem hardlinks | Avoid competing with training for RAM via `/tmp` tmpfs |
 | Config on resume | Selective field restore, not wholesale replace | Prevent silent hyperparameter reversion |
-| Telemetry | Per-rank/per-GPU CSV columns | OOM and utilization issues can be GPU-specific |
+| Telemetry | Averaged GPU/VRAM columns, shared schema with Colab | Cross-platform comparability; per-rank detail still available via console logs |
 | Failure handling | Preflight checks, graceful degradation, guarded fallbacks | Fail fast and loud instead of slow and silent |
 
 ---
 
-*Report generated from `optimized_telemetry_ipynb.ipynb` (15 cells: setup, environment check, path/registry configuration, embedded `train_ddp.py` training script, script verification, training launch, checkpoint inspection).*
+*Report generated from `optimized_telemetry_ipynb.ipynb` (15 cells: setup, environment check, path/registry configuration, embedded `train_ddp.py` training script, script verification, training launch, checkpoint inspection), cross-checked against `train_ddp.py` source and a sample `training_stats.csv` run.*
